@@ -4,8 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Botânico Mármores | Catálogo Digital</title>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root{
     --dark:#16241c; --dark2:#1f3327;
@@ -375,13 +374,13 @@ let currentProduct = null; // modal
 let activeCategory = null;
 let activeColor = null;
 
-/* ===== FIREBASE ===== */
-const firebaseConfig = { apiKey:"", authDomain:"", projectId:"", storageBucket:"", messagingSenderId:"", appId:"" };
-let db=null, firebaseReady=false;
-if(firebaseConfig.apiKey){
-  try{ firebase.initializeApp(firebaseConfig); db=firebase.firestore(); firebaseReady=true; }
-  catch(e){ console.warn('Firebase não inicializado:', e); }
-}
+/* ===== SUPABASE (banco de dados online, sincroniza entre todos) ===== */
+const SUPABASE_URL = "https://wodhadtgbdrmadkkqgpy.supabase.co";
+const SUPABASE_KEY = "sb_publishable_jjFCjwM03XIE2Xq5VNxdyQ_oNVAIY4w";
+let sb=null, sbReady=false, applyingRemote=false;
+try{
+  if(window.supabase && SUPABASE_URL){ sb=window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY); sbReady=true; }
+}catch(e){ console.warn('Supabase não inicializado:', e); }
 
 let catalog = assignIds(deepClone(DEFAULT_CATALOG));
 
@@ -398,27 +397,53 @@ function loadLocal(){
   }catch(e){}
   return assignIds(deepClone(DEFAULT_CATALOG));
 }
+
+let saveTimer=null;
 function saveCatalog(){
-  if(firebaseReady&&db){ db.collection('catalog').doc('main').set({data:JSON.stringify(catalog),updatedAt:Date.now()}).catch(e=>console.error(e)); }
-  else{ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(catalog)); }catch(e){} }
+  // salva sempre uma cópia local (offline/fallback)
+  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(catalog)); }catch(e){}
+  if(sbReady&&sb&&!applyingRemote){
+    clearTimeout(saveTimer);
+    saveTimer=setTimeout(()=>{
+      sb.from('catalog').update({ data: catalog, updated_at:new Date().toISOString() }).eq('id','main')
+        .then(({error})=>{ if(error) console.error('Erro ao salvar no Supabase:', error); });
+    }, 400);
+  }
   flashSaved();
 }
 function flashSaved(){ const f=document.getElementById('saveFlash'); f.classList.add('show'); setTimeout(()=>f.classList.remove('show'),1400); }
 
 function resetToDefault(){ catalog=assignIds(deepClone(DEFAULT_CATALOG)); saveCatalog(); renderColorFilter(); renderCatalog(); renderAdmin(); }
 
+function applyRemote(data){
+  try{
+    const p = typeof data==='string'? JSON.parse(data) : data;
+    const t = p.reduce((s,x)=>s+(x.items?x.items.length:0),0);
+    catalog = t? assignIds(p) : assignIds(deepClone(DEFAULT_CATALOG));
+  }catch(e){ catalog=assignIds(deepClone(DEFAULT_CATALOG)); }
+  renderColorFilter(); renderCatalog(searchVal());
+  if(document.getElementById('adminPanel').classList.contains('open')) renderAdmin();
+}
+
 function initSource(){
-  if(firebaseReady&&db){
-    db.collection('catalog').doc('main').onSnapshot(function(doc){
-      if(doc.exists&&doc.data().data){
-        try{ const p=JSON.parse(doc.data().data); const t=p.reduce((s,x)=>s+(x.items?x.items.length:0),0);
-          catalog = t? assignIds(p) : assignIds(deepClone(DEFAULT_CATALOG)); }
-        catch(e){ catalog=assignIds(deepClone(DEFAULT_CATALOG)); }
-      }else{ catalog=assignIds(deepClone(DEFAULT_CATALOG)); saveCatalog(); }
-      renderColorFilter(); renderCatalog(searchVal());
-      if(document.getElementById('adminPanel').classList.contains('open')) renderAdmin();
-    }, function(err){ console.error('Firebase erro, usando local.',err); catalog=loadLocal(); renderColorFilter(); renderCatalog(); });
-  }else{ catalog=loadLocal(); renderColorFilter(); renderCatalog(); }
+  if(sbReady&&sb){
+    // 1) carga inicial
+    sb.from('catalog').select('data').eq('id','main').single().then(({data,error})=>{
+      if(error){ console.error('Supabase leitura falhou, usando local.', error); catalog=loadLocal(); renderColorFilter(); renderCatalog(); return; }
+      const arr = data && data.data ? data.data : [];
+      const t = Array.isArray(arr)? arr.reduce((s,x)=>s+(x.items?x.items.length:0),0) : 0;
+      if(t>0){ applyingRemote=true; applyRemote(arr); applyingRemote=false; }
+      else{ catalog=assignIds(deepClone(DEFAULT_CATALOG)); renderColorFilter(); renderCatalog(); saveCatalog(); }
+    });
+    // 2) tempo real: quando alguém salva, todos recebem
+    sb.channel('catalog-changes')
+      .on('postgres_changes',{event:'UPDATE',schema:'public',table:'catalog',filter:'id=eq.main'},payload=>{
+        if(payload.new && payload.new.data){ applyingRemote=true; applyRemote(payload.new.data); applyingRemote=false; }
+      })
+      .subscribe();
+  }else{
+    catalog=loadLocal(); renderColorFilter(); renderCatalog();
+  }
 }
 
 function searchVal(){ const el=document.getElementById('searchInput'); return el?el.value:""; }
